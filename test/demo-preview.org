@@ -1,0 +1,21 @@
+#+title: Sixel Display Preview Demo
+
+This file exercises Org LaTeX previews and link-preview commands.
+
+Inline image link:
+
+[[file:smiley.png]]
+
+Named file link:
+
+[[file:smiley.png][Smiley PNG]]
+
+LaTeX fragments:
+
+Inline: \(e^{i\pi} + 1 = 0\)
+
+Displayed:
+
+\[
+\int_0^{2\pi} \sin(x)\,dx = 0
+\]

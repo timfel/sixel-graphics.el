@@ -1,0 +1,8 @@
+#+title: Sixel Display Demo
+#+startup: inlineimages
+
+This file exercises inline Org image display.
+
+[[file:smiley.png]]
+
+Text below the image to make scrolling and refresh behavior visible.
