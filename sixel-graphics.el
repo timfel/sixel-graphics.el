@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;; Author: Tim Felgentreff <timfelgentreff@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "29.0"))
 ;; URL: https://github.com/timfel/sixel-graphics.el
@@ -98,7 +98,23 @@
   :group 'sixel-graphics)
 
 (defcustom sixel-graphics-temp-file-limit 32
-  "Maximum number of unreferenced temporary image files to keep around."
+  "Maximum number of temporary image files to keep around.
+When the limit is exceeded, the oldest registered files are evicted
+immediately, even if an overlay may still reference them."
+  :type 'integer
+  :group 'sixel-graphics)
+
+(defcustom sixel-graphics-temp-file-prune-buffer-limit 32
+  "Maximum number of buffers pruning will inspect for live temp-file use.
+If this limit is exceeded, pruning skips the overlay scan and evicts
+the oldest file immediately."
+  :type 'integer
+  :group 'sixel-graphics)
+
+(defcustom sixel-graphics-temp-file-prune-overlay-limit 64
+  "Maximum number of overlays pruning will inspect for live temp-file use.
+If this limit is exceeded, pruning skips the overlay scan and evicts
+the oldest file immediately."
   :type 'integer
   :group 'sixel-graphics)
 
@@ -501,29 +517,62 @@ permitted."
         (delete-file file)))))
 
 (defun sixel-graphics--temp-file-in-use-p (file)
-  "Return non-nil when FILE is still referenced by a live overlay."
-  (cl-some
-   (lambda (buf)
-     (with-current-buffer buf
-       (cl-some
-        (lambda (ov)
-          (and (overlay-buffer ov)
-               (equal (overlay-get ov 'sixel-graphics-delete-file) file)))
-        sixel-graphics--overlays)))
-   (buffer-list)))
+  "Return the liveness state for temporary FILE.
+The return value is t when a live overlay references FILE, nil when no
+such overlay is found within the configured scan limits, and the symbol
+`too-expensive' when the scan would exceed those limits."
+  (let ((buffers-left (max 0 sixel-graphics-temp-file-prune-buffer-limit))
+        (overlays-left (max 0 sixel-graphics-temp-file-prune-overlay-limit)))
+    (catch 'result
+      (dolist (buf (buffer-list))
+        (setq buffers-left (1- buffers-left))
+        (when (< buffers-left 0)
+          (throw 'result 'too-expensive))
+        (dolist (ov (buffer-local-value 'sixel-graphics--overlays buf))
+          (setq overlays-left (1- overlays-left))
+          (when (< overlays-left 0)
+            (throw 'result 'too-expensive))
+          (when (and (overlay-buffer ov)
+                     (equal (overlay-get ov 'sixel-graphics-delete-file) file))
+            (throw 'result t))))
+      nil)))
+
+(defun sixel-graphics--evict-oldest-temp-file ()
+  "Delete the oldest registered temporary image file."
+  (when-let ((victim (car (last sixel-graphics--temp-files))))
+    (setq sixel-graphics--temp-files (butlast sixel-graphics--temp-files))
+    (ignore-errors
+      (when (file-exists-p victim)
+        (delete-file victim)))
+    victim))
+
+(defun sixel-graphics--defer-oldest-temp-file ()
+  "Move the oldest registered temporary image file to the front of the LRU."
+  (when-let ((victim (car (last sixel-graphics--temp-files))))
+    (setq sixel-graphics--temp-files
+          (cons victim (butlast sixel-graphics--temp-files)))
+    victim))
 
 (defun sixel-graphics--prune-temp-files ()
-  "Delete oldest unreferenced temporary image files beyond the configured limit."
+  "Delete oldest temporary image files beyond the configured limit."
   (while (> (length sixel-graphics--temp-files)
             (max 0 sixel-graphics-temp-file-limit))
-    (let ((victim (car (last sixel-graphics--temp-files))))
-      (if (sixel-graphics--temp-file-in-use-p victim)
-          (setq sixel-graphics--temp-files
-                (append (butlast sixel-graphics--temp-files) (list victim)))
-        (setq sixel-graphics--temp-files (butlast sixel-graphics--temp-files))
-        (ignore-errors
-          (when (file-exists-p victim)
-            (delete-file victim)))))))
+    (let ((attempts (length sixel-graphics--temp-files))
+          (evicted nil))
+      (while (and (> attempts 0)
+                  (not evicted)
+                  (> (length sixel-graphics--temp-files)
+                     (max 0 sixel-graphics-temp-file-limit)))
+        (pcase (sixel-graphics--temp-file-in-use-p
+                (car (last sixel-graphics--temp-files)))
+          ('t
+           (sixel-graphics--defer-oldest-temp-file)
+           (setq attempts (1- attempts)))
+          (_
+           (sixel-graphics--evict-oldest-temp-file)
+           (setq evicted t))))
+      (unless evicted
+        (sixel-graphics--evict-oldest-temp-file)))))
 
 (defun sixel-graphics--register-temp-file (file)
   "Register FILE in the temporary image cache."
