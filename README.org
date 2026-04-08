@@ -43,3 +43,5 @@ You get the idea.
 ** Customization
 
 Via the ~sixel-graphics~ group.
+In particular, ~sixel-graphics-encoder-timeout~ defaults to 5 seconds and
+aborts a stuck ~img2sixel~ process.

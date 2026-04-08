@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 
 ;; Author: Tim Felgentreff <timfelgentreff@gmail.com>
-;; Version: 0.1.1
+;; Version: 0.1.2
 ;; Keywords: terminals, images, multimedia
 ;; Package-Requires: ((emacs "29.0"))
 ;; URL: https://github.com/timfel/sixel-graphics.el
@@ -85,6 +85,15 @@
 (defcustom sixel-graphics-encoder-args nil
   "Extra arguments passed to `sixel-graphics-encoder-program'."
   :type '(repeat string)
+  :group 'sixel-graphics)
+
+(defcustom sixel-graphics-encoder-timeout 5.0
+  "Maximum time in seconds to wait for a single encoder invocation.
+
+When nil, wait indefinitely for `sixel-graphics-encoder-program' to
+finish."
+  :type '(choice (const :tag "No timeout" nil)
+                 number)
   :group 'sixel-graphics)
 
 (defcustom sixel-graphics-identify-program "identify"
@@ -349,6 +358,58 @@ permitted."
           (cons (string-to-number (match-string 1))
                 (string-to-number (match-string 2))))))))
 
+(defun sixel-graphics--run-process-with-timeout (program destination timeout &rest args)
+  "Run PROGRAM with ARGS, writing stdout to DESTINATION.
+
+If TIMEOUT is non-nil, terminate the process when it runs longer than
+TIMEOUT seconds.  Signal an error on timeout or non-zero exit."
+  (let* ((stderr-buffer (generate-new-buffer " *sixel-graphics-stderr*"))
+         (process-connection-type nil)
+         (process (make-process :name "sixel-graphics-process"
+                                :buffer destination
+                                :command (cons program args)
+                                :coding 'binary
+                                :connection-type 'pipe
+                                :stderr stderr-buffer
+                                :noquery t))
+         (timer (and timeout
+                     (> timeout 0)
+                     (run-at-time
+                      timeout nil
+                      (lambda (proc)
+                        (when (process-live-p proc)
+                          (process-put proc 'sixel-graphics-timed-out t)
+                          (delete-process proc)))
+                      process))))
+    (set-process-sentinel process #'ignore)
+    (unwind-protect
+        (progn
+          (while (process-live-p process)
+            (accept-process-output process 0.1))
+          (let ((stderr (string-trim
+                         (with-current-buffer stderr-buffer
+                           (buffer-string)))))
+            (cond
+             ((process-get process 'sixel-graphics-timed-out)
+              (error "Process %s timed out after %.1fs"
+                     program
+                     (float timeout)))
+             ((zerop (process-exit-status process))
+              0)
+             ((string-empty-p stderr)
+              (error "Process %s failed with exit code %d"
+                     program
+                     (process-exit-status process)))
+             (t
+              (error "Process %s failed with exit code %d: %s"
+                     program
+                     (process-exit-status process)
+                     stderr)))))
+      (when timer
+        (cancel-timer timer))
+      (when (buffer-live-p stderr-buffer)
+        (kill-buffer stderr-buffer)))))
+
 (defun sixel-graphics--encode-file-raw (file &optional width height)
   "Encode FILE as Sixel at WIDTH and HEIGHT."
   (let* ((file (expand-file-name file))
@@ -364,33 +425,39 @@ permitted."
           (unless (sixel-graphics--encoder-available-p)
             (error "Sixel encoder not found: %s" sixel-graphics-encoder-program))
           (with-temp-buffer
-            (let ((status (apply #'process-file
-                                 sixel-graphics-encoder-program
-                                 nil t nil
-                                 (append sixel-graphics-encoder-args
-                                         (when width
-                                           (list "-w" width-arg))
-                                         (when height
-                                           (list "-h" height-arg))
-                                         (list file)))))
-              (unless (zerop status)
-                (error "Sixel encoding failed for %s" file))
-              (let* ((payload (buffer-string))
-                     (pixel-size (or (sixel-graphics--payload-pixel-size payload)
-                                     (and width height (cons width height)))))
-                (unless pixel-size
-                  (error "Could not determine Sixel raster size for %s" file))
-                (pcase-let ((`(,cols . ,rows)
-                             (sixel-graphics--pixel-size-to-cells
-                              (car pixel-size) (cdr pixel-size))))
-                  (let ((entry (list :source file
-                                     :payload payload
-                                     :pixel-width (car pixel-size)
-                                     :pixel-height (cdr pixel-size)
-                                     :cols cols
-                                     :rows rows)))
-                    (sixel-graphics--cache-put key entry)
-                    entry)))))))))
+            (condition-case err
+                (let ((encoder-args
+                       (append sixel-graphics-encoder-args
+                               (when width
+                                 (list "-w" width-arg))
+                               (when height
+                                 (list "-h" height-arg))
+                               (list file))))
+                  (apply #'sixel-graphics--run-process-with-timeout
+                         sixel-graphics-encoder-program
+                         (current-buffer)
+                         sixel-graphics-encoder-timeout
+                         encoder-args)
+                  (let* ((payload (buffer-string))
+                         (pixel-size (or (sixel-graphics--payload-pixel-size payload)
+                                         (and width height (cons width height)))))
+                    (unless pixel-size
+                      (error "Could not determine Sixel raster size for %s" file))
+                    (pcase-let ((`(,cols . ,rows)
+                                 (sixel-graphics--pixel-size-to-cells
+                                  (car pixel-size) (cdr pixel-size))))
+                      (let ((entry (list :source file
+                                         :payload payload
+                                         :pixel-width (car pixel-size)
+                                         :pixel-height (cdr pixel-size)
+                                         :cols cols
+                                         :rows rows)))
+                        (sixel-graphics--cache-put key entry)
+                        entry))))
+              (error
+               (error "Sixel encoding failed for %s: %s"
+                      file
+                      (error-message-string err)))))))))
 
 (defun sixel-graphics--image-pixel-size (file)
   "Return FILE image dimensions as (WIDTH . HEIGHT)."
